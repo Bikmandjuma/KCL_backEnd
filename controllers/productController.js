@@ -1,15 +1,12 @@
 const asyncHandler = require('express-async-handler')
-const { Op, fn, col } = require('sequelize')
 const slugify = require('slugify')
-const { Product, Rating, User } = require('../models')
+const { prisma } = require('../config/dbConnection')
 const { toClientJSON } = require('../utils/transform')
 const { getPagination, buildPageResult } = require('../utils/paginate')
 const { encodeId, decodeId } = require('../utils/idHash')
+const { toNumber, toBool } = require('../utils/coerce')
 
-const withHash = (product) => {
-    const plain = product.get ? product.get({ plain: true }) : product
-    return { ...plain, hash: encodeId(plain.id) }
-}
+const withHash = (product) => ({ ...product, hash: encodeId(product.id) })
 
 //Get all Products - All Users can access (storefront only sees active ones)
 //Supports ?search=&category=&page=&limit=&new=true&all=true (staff only)
@@ -22,16 +19,19 @@ getProducts = asyncHandler(async(req,res)=>{
     const where = {}
     if (!qAll) where.active = true
     if (qCategory) where.categories = qCategory
-    if (qSearch) where.title = { [Op.like]: `%${qSearch}%` }
+    if (qSearch) where.title = { contains: qSearch }
 
     if (qNew){
-        const products = await Product.findAll({ where, order: [['createdAt', 'DESC']], limit: 8 })
+        const products = await prisma.product.findMany({ where, orderBy: { createdAt: 'desc' }, take: 8 })
         return res.status(200).json(toClientJSON(products.map(withHash)))
     }
 
     const { page, limit, offset } = getPagination(req.query, 12)
-    const result = await Product.findAndCountAll({ where, order: [['createdAt', 'DESC']], limit, offset })
-    const paged = buildPageResult(result, page, limit)
+    const [rows, count] = await Promise.all([
+        prisma.product.findMany({ where, orderBy: { createdAt: 'desc' }, take: limit, skip: offset }),
+        prisma.product.count({ where }),
+    ])
+    const paged = buildPageResult({ rows, count }, page, limit)
     paged.items = paged.items.map(withHash)
     res.status(200).json(toClientJSON(paged))
 })
@@ -42,8 +42,9 @@ getProduct = asyncHandler(async(req,res)=>{
     const id = /^\d+$/.test(raw) ? Number(raw) : decodeId(raw)
     if (!id){ res.status(400); throw new Error('Invalid product reference') }
 
-    const product = await Product.findByPk(id, {
-        include: [{ model: Rating, as: 'ratings', include: [{ model: User, as: 'postedby', attributes: ['id', 'username'] }] }]
+    const product = await prisma.product.findUnique({
+        where: { id },
+        include: { ratings: { include: { postedby: { select: { id: true, username: true } } } } },
     })
     if (!product){
         res.status(400)
@@ -54,9 +55,9 @@ getProduct = asyncHandler(async(req,res)=>{
 
 //Get distinct categories (machine types)
 getCategories = asyncHandler(async(req,res)=>{
-    const rows = await Product.findAll({
-        attributes: [[fn('DISTINCT', col('categories')), 'categories']],
-        raw: true,
+    const rows = await prisma.product.findMany({
+        distinct: ['categories'],
+        select: { categories: true },
     })
     res.status(200).json(rows.map((r) => r.categories))
 })
@@ -64,86 +65,123 @@ getCategories = asyncHandler(async(req,res)=>{
 //Create a Product - Only Admin / permitted Manager
 createProduct = asyncHandler(async(req,res)=>{
     const userId = req.user._id
-    const body = { ...req.body }
+    const body = req.body
     if (!body.title || !body.price){
         res.status(400)
         throw new Error('Title and price are mandatory')
     }
-    body.slug = slugify(body.title + '-' + Date.now(), { lower: true })
+    const slug = slugify(body.title + '-' + Date.now(), { lower: true })
 
     const files = req.files || {}
-    if (files.image?.[0]) body.image = `/uploads/products/${files.image[0].filename}`
-    if (files.gallery?.length) body.gallery = files.gallery.map((f) => `/uploads/products/${f.filename}`)
+    const image = files.image?.[0] ? `/uploads/products/${files.image[0].filename}` : body.image
+    const gallery = files.gallery?.length ? files.gallery.map((f) => `/uploads/products/${f.filename}`) : []
+    if (!image) { res.status(400); throw new Error('An image is required') }
 
-    const product = await Product.create({ ...body, listedById: userId })
+    const product = await prisma.product.create({
+        data: {
+            title: body.title,
+            slug,
+            price: toNumber(body.price),
+            categories: body.categories,
+            brand: body.brand,
+            quantity: toNumber(body.quantity) ?? 0,
+            color: body.color,
+            image,
+            gallery,
+            desc: body.desc,
+            size: body.size,
+            featured: toBool(body.featured) ?? false,
+            active: body.active !== undefined ? toBool(body.active) : true,
+            listedById: userId,
+        },
+    })
     res.status(201).json(toClientJSON(withHash(product)))
 })
 
 //Update a Product - Only Admin / permitted Manager
 updateProduct = asyncHandler(async(req,res)=>{
-    const product = await Product.findByPk(req.params.id)
+    const product = await prisma.product.findUnique({ where: { id: Number(req.params.id) } })
     if (!product){
         res.status(400)
         throw new Error('No Product Available')
     }
-    const body = { ...req.body }
-    if (body.title) body.slug = slugify(body.title + '-' + req.params.id, { lower: true })
+    const body = req.body
+    const data = {}
+    if (body.title !== undefined) {
+        data.title = body.title
+        data.slug = slugify(body.title + '-' + product.id, { lower: true })
+    }
+    if (body.price !== undefined) data.price = toNumber(body.price)
+    if (body.categories !== undefined) data.categories = body.categories
+    if (body.brand !== undefined) data.brand = body.brand
+    if (body.quantity !== undefined) data.quantity = toNumber(body.quantity)
+    if (body.color !== undefined) data.color = body.color
+    if (body.desc !== undefined) data.desc = body.desc
+    if (body.size !== undefined) data.size = body.size
+    if (body.featured !== undefined) data.featured = toBool(body.featured)
+    if (body.active !== undefined) data.active = toBool(body.active)
 
     const files = req.files || {}
-    if (files.image?.[0]) body.image = `/uploads/products/${files.image[0].filename}`
-    if (files.gallery?.length) body.gallery = files.gallery.map((f) => `/uploads/products/${f.filename}`)
+    if (files.image?.[0]) data.image = `/uploads/products/${files.image[0].filename}`
+    if (files.gallery?.length) data.gallery = files.gallery.map((f) => `/uploads/products/${f.filename}`)
 
-    await product.update(body)
-    res.status(200).json(toClientJSON(withHash(product)))
+    const updated = await prisma.product.update({ where: { id: product.id }, data })
+    res.status(200).json(toClientJSON(withHash(updated)))
 })
 
 //Delete a Product - Only Admin / permitted Manager
 deleteProduct = asyncHandler(async(req,res)=>{
-    const product = await Product.findByPk(req.params.id)
+    const product = await prisma.product.findUnique({ where: { id: Number(req.params.id) } })
     if (!product){
         res.status(400)
         throw new Error('No Product Available')
     }
-    await product.destroy()
+    await prisma.product.delete({ where: { id: product.id } })
     res.status(200).json(toClientJSON(product))
 })
 
 addToWishlist = asyncHandler(async(req,res)=>{
     const userId = req.user._id
-    const { productId } = req.body
-    const user = await User.findByPk(userId)
+    const productId = Number(req.body.productId)
+    const user = await prisma.user.findUnique({ where: { id: userId } })
     if (!user) throw new Error('No such User found')
 
-    const alreadyAdded = await user.hasWishlist(productId)
-    if (alreadyAdded){
-        await user.removeWishlist(productId)
+    const existing = await prisma.wishlist.findUnique({
+        where: { userId_productId: { userId, productId } },
+    })
+    if (existing){
+        await prisma.wishlist.delete({ where: { userId_productId: { userId, productId } } })
     } else {
-        await user.addWishlist(productId)
+        await prisma.wishlist.create({ data: { userId, productId } })
     }
-    const updated = await User.findByPk(userId, { include: [{ model: Product, as: 'wishlist' }] })
-    res.json(toClientJSON(updated))
+    const wishlistItems = await prisma.wishlist.findMany({ where: { userId }, include: { product: true } })
+    res.json(toClientJSON({
+        id: user.id, username: user.username, email: user.email,
+        wishlist: wishlistItems.map((w) => w.product),
+    }))
 })
 
 rating = asyncHandler(async(req,res)=>{
     const userId = req.user._id
     const { star, productId, comments } = req.body
-    const product = await Product.findByPk(productId)
+    const pid = Number(productId)
+    const product = await prisma.product.findUnique({ where: { id: pid } })
     if (!product) throw new Error('No such product found')
 
-    const existing = await Rating.findOne({ where: { productId, userId } })
+    const existing = await prisma.rating.findFirst({ where: { productId: pid, userId } })
     if (existing){
-        await existing.update({ star, comments })
+        await prisma.rating.update({ where: { id: existing.id }, data: { star: Number(star), comments } })
     } else {
-        await Rating.create({ star, comments, productId, userId })
+        await prisma.rating.create({ data: { star: Number(star), comments, productId: pid, userId } })
     }
 
-    const allRatings = await Rating.findAll({ where: { productId } })
+    const allRatings = await prisma.rating.findMany({ where: { productId: pid } })
     const totalRatings = allRatings.length
     const ratingSum = allRatings.reduce((a, r) => a + r.star, 0)
     const actualRating = totalRatings ? Math.round(ratingSum / totalRatings) : 0
 
-    await product.update({ totalRatings: actualRating })
-    const productWithRatings = await Product.findByPk(productId, { include: [{ model: Rating, as: 'ratings' }] })
+    await prisma.product.update({ where: { id: pid }, data: { totalRatings: actualRating } })
+    const productWithRatings = await prisma.product.findUnique({ where: { id: pid }, include: { ratings: true } })
     res.json(toClientJSON(productWithRatings))
 })
 
@@ -152,18 +190,18 @@ rating = asyncHandler(async(req,res)=>{
 searchProducts = asyncHandler(async(req,res)=>{
     const q = (req.query.q || '').trim()
     if (!q){ return res.status(200).json([]) }
-    const products = await Product.findAll({
+    const products = await prisma.product.findMany({
         where: {
             active: true,
-            [Op.or]: [
-                { title: { [Op.like]: `%${q}%` } },
-                { categories: { [Op.like]: `%${q}%` } },
-                { brand: { [Op.like]: `%${q}%` } },
-                { desc: { [Op.like]: `%${q}%` } },
+            OR: [
+                { title: { contains: q } },
+                { categories: { contains: q } },
+                { brand: { contains: q } },
+                { desc: { contains: q } },
             ],
         },
-        limit: 10,
-        order: [['createdAt', 'DESC']],
+        take: 10,
+        orderBy: { createdAt: 'desc' },
     })
     res.status(200).json(toClientJSON(products.map(withHash)))
 })

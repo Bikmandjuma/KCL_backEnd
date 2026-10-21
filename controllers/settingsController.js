@@ -1,14 +1,21 @@
 const asyncHandler = require('express-async-handler')
-const { Settings } = require('../models')
+const { prisma } = require('../config/dbConnection')
 const { toClientJSON } = require('../utils/transform')
 
 const getOrCreate = async () => {
-    let settings = await Settings.findOne()
-    if (!settings) settings = await Settings.create({})
+    let settings = await prisma.settings.findFirst()
+    if (!settings) settings = await prisma.settings.create({ data: {} })
     return settings
 }
 
-// Public - the storefront needs to know which payment options are visible
+const paymentsShape = (plain) => ({
+    cashEnabled: plain.cashEnabled,
+    momoPayEnabled: plain.momoPayEnabled,
+    momoCodeEnabled: plain.momoCodeEnabled,
+})
+
+// Public - the app needs this to know which of Cash/MoMo Pay/MoMo Code to
+// show at checkout, and the actual number/code to pay to for the MoMo options.
 getPublicSettings = asyncHandler(async(req,res)=>{
     const settings = await getOrCreate()
     res.status(200).json(toClientJSON({
@@ -17,29 +24,18 @@ getPublicSettings = asyncHandler(async(req,res)=>{
         phone: settings.phone,
         whatsapp: settings.whatsapp,
         address: settings.address,
-        mtnNumber: settings.mtnNumber,
-        mtnCode: settings.mtnCode,
-        payments: {
-            stripeEnabled: settings.stripeEnabled,
-            mtnEnabled: settings.mtnEnabled,
-            codEnabled: settings.codEnabled,
-            manualProofEnabled: settings.manualProofEnabled,
-        }
+        momoPayNumber: settings.momoPayNumber,
+        momoCode: settings.momoCode,
+        payments: paymentsShape(settings),
     }))
 })
 
 // Admin only - full settings document (flattened payment fields -> nested `payments` for the frontend)
 getSettings = asyncHandler(async(req,res)=>{
     const settings = await getOrCreate()
-    const plain = settings.get({ plain: true })
     res.status(200).json(toClientJSON({
-        ...plain,
-        payments: {
-            stripeEnabled: plain.stripeEnabled,
-            mtnEnabled: plain.mtnEnabled,
-            codEnabled: plain.codEnabled,
-            manualProofEnabled: plain.manualProofEnabled,
-        }
+        ...settings,
+        payments: paymentsShape(settings),
     }))
 })
 
@@ -51,16 +47,14 @@ updateSettings = asyncHandler(async(req,res)=>{
         Object.assign(body, body.payments)
         delete body.payments
     }
-    await settings.update(body)
-    const plain = settings.get({ plain: true })
+    const allowed = ['siteName','tagline','phone','whatsapp','address','cashEnabled','momoPayEnabled','momoCodeEnabled','momoPayNumber','momoCode']
+    const data = {}
+    for (const key of allowed) if (body[key] !== undefined) data[key] = body[key]
+
+    const updated = await prisma.settings.update({ where: { id: settings.id }, data })
     res.status(200).json(toClientJSON({
-        ...plain,
-        payments: {
-            stripeEnabled: plain.stripeEnabled,
-            mtnEnabled: plain.mtnEnabled,
-            codEnabled: plain.codEnabled,
-            manualProofEnabled: plain.manualProofEnabled,
-        }
+        ...updated,
+        payments: paymentsShape(updated),
     }))
 })
 

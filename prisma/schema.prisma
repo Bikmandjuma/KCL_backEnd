@@ -1,0 +1,477 @@
+// Kigali Coffee Lab (KCL) - Prisma schema
+// MySQL, ported 1:1 from the previous Sequelize models. Table names and
+// column names were kept identical (Sequelize already used camelCase
+// columns) so no other code outside this schema + the ORM calls needed to
+// change shape.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  admin
+  manager
+  guest
+}
+
+enum OrderType {
+  dine_in
+  pickup
+  delivery
+}
+
+// MySQL enum values can't contain spaces, so the DB-level names are mapped
+// back to the exact strings the rest of the app (and the app UI) expects.
+enum PaymentMethod {
+  Cash
+  MoMoPay  @map("MoMo Pay")
+  MoMoCode @map("MoMo Code")
+}
+
+enum DrinkType {
+  coffee
+  food
+}
+
+enum ItemType {
+  machine
+  menu
+}
+
+enum Gender {
+  Male
+  Female
+  Other
+}
+
+// The 4 Coffee Training courses. `barista` is local-only (no level); the
+// other three each run toward an international certification with 3 levels.
+enum CourseType {
+  barista
+  cupping
+  roasting
+  cva
+}
+
+enum CourseLevel {
+  Foundation
+  Intermediate
+  Professional
+}
+
+enum BookingStatus {
+  Upcoming
+  Active
+  Completed
+  Cancelled
+}
+
+enum ApplicationStatus {
+  Pending
+  Approved
+  Rejected
+}
+
+model User {
+  id          Int      @id @default(autoincrement())
+  username    String   @unique
+  email       String   @unique
+  password    String
+  // role drives access across the app: admin | manager | guest (client)
+  role        Role     @default(guest)
+  // kept for backward compatibility with existing token/middleware checks
+  isAdmin     Boolean  @default(false)
+  permissions Json?
+  phone       String?
+  address     String?
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  listedProducts Product[]  @relation("ProductListedBy")
+  listedDrinks   Drink[]    @relation("DrinkListedBy")
+  ratings        Rating[]
+  wishlistItems  Wishlist[]
+  cart           Cart?
+  orders         Order[]
+  visits         Visit[]
+
+  @@map("users")
+}
+
+// Products represent Coffee Machines sold by Kigali Coffee Lab (KCL)
+model Product {
+  id           Int      @id @default(autoincrement())
+  title        String
+  slug         String   @unique
+  price        Float
+  categories   String // e.g. Espresso Machine
+  brand        String?
+  quantity     Int      @default(0) // stock left in store
+  sold         Int      @default(0)
+  color        String?
+  image        String
+  gallery      Json?
+  desc         String?  @db.Text
+  size         String?
+  featured     Boolean  @default(false)
+  active       Boolean  @default(true) // admin can hide without deleting
+  totalRatings Int      @default(0)
+  listedById   Int?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  listedBy     User?       @relation("ProductListedBy", fields: [listedById], references: [id])
+  ratings      Rating[]
+  wishlistedBy Wishlist[]
+  products     CartItem[]
+  orderItems   OrderItem[]
+
+  @@map("products")
+}
+
+// One row per user review on a product
+model Rating {
+  id        Int      @id @default(autoincrement())
+  star      Int
+  comments  String?  @db.Text
+  productId Int
+  userId    Int
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  product  Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  postedby User    @relation(fields: [userId], references: [id])
+
+  @@map("ratings")
+}
+
+// Explicit join table for the User <-> Product wishlist (kept explicit,
+// rather than an implicit Prisma m2m, so the underlying table/columns stay
+// exactly what they were under Sequelize's `through: 'wishlists'`).
+model Wishlist {
+  userId    Int
+  productId Int
+  createdAt DateTime @default(now())
+
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@id([userId, productId])
+  @@map("wishlists")
+}
+
+// Menu items for the KCL catalog - both coffee (Hot Drinks/Cold Drinks/
+// Specialty) and food (Pastries/Sandwiches/etc) live here, distinguished by
+// `type`. Both are prepared and served in-shop, so orders containing any of
+// these are always dine-in/pickup (see orderController) - never delivered.
+model Drink {
+  id         Int       @id @default(autoincrement())
+  name       String
+  price      Float
+  type       DrinkType @default(coffee)
+  category   String    @default("Hot Drinks")
+  image      String?
+  desc       String?   @db.Text
+  available  Boolean   @default(true)
+  listedById Int?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  listedBy   User?       @relation("DrinkListedBy", fields: [listedById], references: [id])
+  orderItems OrderItem[]
+
+  @@map("drinks")
+}
+
+model Cart {
+  id        Int      @id @default(autoincrement())
+  total     Float    @default(0)
+  userId    Int      @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user     User       @relation(fields: [userId], references: [id])
+  products CartItem[]
+
+  @@map("carts")
+}
+
+// A snapshotted line-item inside a Cart (denormalised title/price/image so
+// cart contents survive product edits)
+model CartItem {
+  id        Int      @id @default(autoincrement())
+  quantity  Int      @default(1)
+  title     String?
+  image     String?
+  price     Float?
+  cartId    Int
+  productId Int?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  cart    Cart     @relation(fields: [cartId], references: [id], onDelete: Cascade)
+  product Product? @relation(fields: [productId], references: [id])
+
+  @@map("cart_items")
+}
+
+// A physical table in the shop (e.g. "Table 1"). Admin/Manager create these;
+// customers pick one when placing a dine-in coffee/food order.
+model Table {
+  id        Int      @id @default(autoincrement())
+  label     String   @unique
+  capacity  Int      @default(4)
+  active    Boolean  @default(true)
+  // Printed on a sticker at the table. Scanning the QR opens
+  // `${FRONTEND_URL}/t/:qrToken`, which resolves this table, so a guest
+  // never sees or needs the raw numeric id. cuid() is generated by Prisma
+  // itself (no native DB function needed), so this works on any MySQL version.
+  qrToken   String   @unique @default(cuid())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  orders   Order[]
+  bookings TableBookingTable[]
+
+  @@map("tables")
+}
+
+// A reservation for one or more tables at a future time. Anyone can book
+// (no login required, same guest-friendly pattern as placing an order) -
+// staff can also manage/cancel from the admin Tables page.
+model TableBooking {
+  id              Int           @id @default(autoincrement())
+  customerName    String
+  customerPhone   String
+  partySize       Int           @default(1)
+  startTime       DateTime
+  durationMinutes Int           @default(60)
+  status          BookingStatus @default(Upcoming)
+  notes           String?       @db.Text
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  tables TableBookingTable[]
+
+  @@map("table_bookings")
+}
+
+// Explicit join table: one booking can cover more than one table at once.
+model TableBookingTable {
+  bookingId Int
+  tableId   Int
+
+  booking TableBooking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  table   Table        @relation(fields: [tableId], references: [id], onDelete: Cascade)
+
+  @@id([bookingId, tableId])
+  @@map("table_booking_tables")
+}
+
+model Order {
+  id        Int    @id @default(autoincrement())
+  // No account/registration required to order - guests are tracked purely
+  // by this public, human-friendly code, e.g. "KCL-482131". `orderById`
+  // stays available for the rare case a logged-in staff/customer account
+  // placed it, but is nullable.
+  orderCode String @unique
+
+  // dine_in: coffee/food, ordered while at the shop, served at a table.
+  // pickup: coffee/food ordered ahead (e.g. from home) with no table -
+  // customer collects it at the counter later.
+  // delivery: coffee-machine purchases only, shipped like e-commerce.
+  orderType OrderType @default(dine_in)
+
+  customerName  String?
+  customerPhone String?
+
+  // How the customer intends to / did pay - cash in person, or MoMo (either
+  // sent to the shop's MoMo Pay number or its MoMo merchant code, both
+  // shown to the customer at checkout via GET /settings/public).
+  paymentMethod   PaymentMethod @default(Cash)
+  paymentIntentId String?
+  paymentAmount   Float?
+  paymentCurrency String        @default("RWF")
+  paymentStatus   String?
+  proofOfPayment  String?
+  callConfirmed   Boolean       @default(false)
+
+  // Free-form on purpose (validated in the controller against
+  // utils/orderStages.js) since dine-in/pickup and delivery orders progress
+  // through two different stage lists, plus the shared 'Cancelled'.
+  orderStatus String @default("Order Placed")
+
+  // Staff set this (in minutes) when they move an order to "Preparing" (or
+  // any later stage) - the customer's tracking screen counts down from
+  // etaSetAt + etaMinutes in real time. Cleared if staff sets a new one.
+  etaMinutes Int?
+  etaSetAt   DateTime?
+
+  email   String?
+  address String? // required only for orderType = delivery
+  contact String?
+  notes   String? @db.Text
+
+  orderById Int?
+  tableId   Int?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  orderby       User?          @relation(fields: [orderById], references: [id])
+  table         Table?         @relation(fields: [tableId], references: [id])
+  products      OrderItem[]
+  notifications Notification[]
+
+  @@map("orders")
+}
+
+// A snapshotted line-item inside an Order. `itemType` says whether this line
+// points at a Product (coffee machine) or a Drink/menu item (coffee or
+// food).
+model OrderItem {
+  id         Int      @id @default(autoincrement())
+  itemType   ItemType @default(machine)
+  quantity   Int      @default(1)
+  title      String?
+  image      String?
+  price      Float?
+  orderId    Int
+  productId  Int?
+  menuItemId Int?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  order    Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product  Product? @relation(fields: [productId], references: [id])
+  menuItem Drink?   @relation(fields: [menuItemId], references: [id])
+
+  @@map("order_items")
+}
+
+// Notifications are looked up by the guest-facing `orderCode`, not a user
+// account, since customers never have to register.
+model Notification {
+  id        Int      @id @default(autoincrement())
+  orderCode String
+  title     String   @default("Order update")
+  message   String   @db.Text
+  type      String   @default("order_status")
+  read      Boolean  @default(false)
+  orderId   Int?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  order Order? @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@map("notifications")
+}
+
+// Singleton row holding site-wide, admin-controlled configuration. Only
+// three payment options exist app-wide: Cash, MoMo Pay (a phone number), and
+// MoMo Code (a merchant till code).
+model Settings {
+  id              Int      @id @default(autoincrement())
+  siteName        String   @default("Kigali Coffee Lab")
+  tagline         String   @default("Roasted with passion, brewed with purpose.")
+  phone           String   @default("+250 700 000 000")
+  whatsapp        String   @default("+250 700 000 000")
+  address         String   @default("KG 7 Ave, Kigali, Rwanda")
+  cashEnabled     Boolean  @default(true)
+  momoPayEnabled  Boolean  @default(true)
+  momoCodeEnabled Boolean  @default(true)
+  momoPayNumber   String   @default("073 000 0000")
+  momoCode        String   @default("")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@map("settings")
+}
+
+// One row per site visit, used purely for dashboard analytics
+model Visit {
+  id        Int      @id @default(autoincrement())
+  path      String?
+  userId    Int?
+  createdAt DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id])
+
+  @@map("visits")
+}
+
+// A training intake window ("cohort") that Admin publishes for one of the
+// four Coffee Training courses. Barista is a local, shop-run course (no
+// `level`); Cupping/Sensory, Roasting, and CVA are each run toward a global
+// certification track with three levels (Foundation, Intermediate,
+// Professional). Applications are only accepted while a session is `active`
+// and within its date range - the countdown and "apply" button on the
+// public course page are both driven off startDate/endDate.
+// (Renamed from BaristaSession; @@map keeps the same underlying table so no
+// existing data or migration history is lost.)
+model TrainingSession {
+  id          Int          @id @default(autoincrement())
+  courseType  CourseType   @default(barista)
+  level       CourseLevel?
+  title       String
+  description String?      @db.Text
+  startDate   DateTime?    @db.Date
+  endDate     DateTime?    @db.Date
+  capacity    Int          @default(20)
+  active      Boolean      @default(true)
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  applications TrainingApplication[]
+
+  @@map("barista_sessions")
+}
+
+// A submitted training application form (Rwanda administrative address:
+// province / district / sector / cell / village).
+// (Renamed from BaristaApplication; @@map keeps the same underlying table.)
+model TrainingApplication {
+  id        Int               @id @default(autoincrement())
+  fullName  String
+  gender    Gender
+  phone     String
+  email     String
+  province  String?
+  district  String?
+  sector    String?
+  cell      String?
+  village   String?
+  status    ApplicationStatus @default(Pending)
+  notes     String?           @db.Text
+  sessionId Int
+  createdAt DateTime          @default(now())
+  updatedAt DateTime          @updatedAt
+
+  session TrainingSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@map("barista_applications")
+}
+
+// A staff member's personal story shown on the public History page: photo
+// on one side, story text on the other, with "Read more" opening a modal
+// for longer stories, plus an optional photo gallery. Admin/Manager
+// (manageHistory) create and edit these; no login needed to view them.
+model StaffStory {
+  id           Int      @id @default(autoincrement())
+  employeeName String
+  roleTitle    String?
+  story        String   @db.Text
+  coverImage   String
+  gallery      Json?
+  active       Boolean  @default(true)
+  sortOrder    Int      @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@map("staff_stories")
+}

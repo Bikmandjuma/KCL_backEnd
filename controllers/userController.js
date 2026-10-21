@@ -1,9 +1,16 @@
 const asyncHandler = require('express-async-handler')
-const { Op } = require('sequelize')
 const CryptoJS = require('crypto-js')
-const { User, Product } = require('../models')
+const { prisma } = require('../config/dbConnection')
 const { toClientJSON } = require('../utils/transform')
 const { getPagination, buildPageResult } = require('../utils/paginate')
+const { allPermissions } = require('../utils/permissions')
+
+// Prisma has no attributes-exclude helper, so select everything except password explicitly.
+const userSelectNoPassword = {
+    id: true, username: true, email: true, role: true, isAdmin: true,
+    permissions: true, phone: true, address: true, active: true,
+    createdAt: true, updatedAt: true,
+}
 
 //Get All Users - only by Admin/Manager(with permission)
 //Supports ?search=&role=&page=&limit=
@@ -12,28 +19,28 @@ getUsers = asyncHandler(async(req,res)=>{
     const where = {}
     if (role) where.role = role
     if (search) {
-        where[Op.or] = [
-            { username: { [Op.like]: `%${search}%` } },
-            { email: { [Op.like]: `%${search}%` } },
+        where.OR = [
+            { username: { contains: search } },
+            { email: { contains: search } },
         ]
     }
 
     if (!pageQ && !limitQ) {
-        const users = await User.findAll({ where, attributes: { exclude: ['password'] } })
+        const users = await prisma.user.findMany({ where, select: userSelectNoPassword })
         return res.status(200).json(toClientJSON(users))
     }
 
     const { page, limit, offset } = getPagination(req.query, 10)
-    const result = await User.findAndCountAll({
-        where, attributes: { exclude: ['password'] },
-        order: [['createdAt', 'DESC']], limit, offset,
-    })
-    res.status(200).json(toClientJSON(buildPageResult(result, page, limit)))
+    const [rows, count] = await Promise.all([
+        prisma.user.findMany({ where, select: userSelectNoPassword, orderBy: { createdAt: 'desc' }, take: limit, skip: offset }),
+        prisma.user.count({ where }),
+    ])
+    res.status(200).json(toClientJSON(buildPageResult({ rows, count }, page, limit)))
 })
 
 //Get your own User
 getUser = asyncHandler(async(req,res)=>{
-    const user = await User.findByPk(req.params.id, { attributes: { exclude: ['password'] } })
+    const user = await prisma.user.findUnique({ where: { id: Number(req.params.id) }, select: userSelectNoPassword })
     if (!user){
         res.status(400)
         throw new Error('No such user Found')
@@ -43,49 +50,50 @@ getUser = asyncHandler(async(req,res)=>{
 
 //Update your own User
 updateUser = asyncHandler(async(req,res)=>{
-    const userAvailable = await User.findByPk(req.params.id)
+    const userAvailable = await prisma.user.findUnique({ where: { id: Number(req.params.id) } })
     if (!userAvailable){
         res.status(400)
         throw new Error('No such user Found')
     }
     const { username, email, password, phone, address } = req.body
-    const updateData = { username, email, phone, address }
+    const data = {}
+    if (username !== undefined) data.username = username
+    if (email !== undefined) data.email = email
+    if (phone !== undefined) data.phone = phone
+    if (address !== undefined) data.address = address
     if (password){
-        updateData.password = CryptoJS.AES.encrypt(password, process.env.PASSWORD_KEY).toString()
+        data.password = CryptoJS.AES.encrypt(password, process.env.PASSWORD_KEY).toString()
     }
 
-    await userAvailable.update(updateData)
-    const { password: pw, ...others } = userAvailable.get({ plain: true })
-    res.status(200).json(toClientJSON(others))
+    const updated = await prisma.user.update({ where: { id: userAvailable.id }, data, select: userSelectNoPassword })
+    res.status(200).json(toClientJSON(updated))
 })
 
 //Delete your own User
 deleteUser = asyncHandler(async(req,res)=>{
-    const user = await User.findByPk(req.params.id)
+    const user = await prisma.user.findUnique({ where: { id: Number(req.params.id) } })
     if (!user){
         res.status(400)
         throw new Error('No User Available')
     }
-    await user.destroy()
+    await prisma.user.delete({ where: { id: user.id } })
     res.status(200).json(toClientJSON({ id: user.id, username: user.username, email: user.email }))
 })
 
 //Get User Wishlist
 getWishlist = asyncHandler(async(req,res)=>{
     const userId = req.user._id
-    const user = await User.findByPk(userId, {
-        include: [{ model: Product, as: 'wishlist' }]
-    })
+    const user = await prisma.user.findUnique({ where: { id: userId } })
     if (!user){ res.status(400); throw new Error('No such user Found') }
-    res.status(200).json(toClientJSON({ username: user.username, wishlist: user.wishlist }))
+    const wishlistItems = await prisma.wishlist.findMany({ where: { userId }, include: { product: true } })
+    res.status(200).json(toClientJSON({ username: user.username, wishlist: wishlistItems.map((w) => w.product) }))
 })
 
 //Save the Address of the User
 saveUserAddress = asyncHandler(async(req,res)=>{
     const userId = req.user._id
     const { address } = req.body
-    const user = await User.findByPk(userId)
-    await user.update({ address })
+    const user = await prisma.user.update({ where: { id: userId }, data: { address } })
     res.json(toClientJSON({ username: user.username, address: user.address }))
 })
 
@@ -102,45 +110,44 @@ createStaff = asyncHandler(async(req,res)=>{
         res.status(400)
         throw new Error('role must be admin or manager')
     }
-    const usernameAvailable = await User.findOne({ where: { username } })
+    const usernameAvailable = await prisma.user.findUnique({ where: { username } })
     if (usernameAvailable){ res.status(400); throw new Error('UserName Taken') }
-    const emailAvailable = await User.findOne({ where: { email } })
+    const emailAvailable = await prisma.user.findUnique({ where: { email } })
     if (emailAvailable){ res.status(400); throw new Error('Email Taken') }
 
     const hashedPassword = CryptoJS.AES.encrypt(password, process.env.PASSWORD_KEY).toString()
-    const user = await User.create({
-        username, email, phone,
-        password: hashedPassword,
-        role,
-        isAdmin: role === 'admin',
-        permissions: role === 'admin' ? {
-            manageProducts: true, manageDrinks: true, manageOrders: true,
-            manageUsers: true, manageSettings: true, viewDashboard: true, manageBarista: true
-        } : (permissions || {})
+    const user = await prisma.user.create({
+        data: {
+            username, email, phone,
+            password: hashedPassword,
+            role,
+            isAdmin: role === 'admin',
+            permissions: role === 'admin' ? allPermissions : (permissions || {}),
+        },
     })
-    const { password: pw, ...others } = user.get({ plain: true })
+    const { password: pw, ...others } = user
     res.status(201).json(toClientJSON(others))
 })
 
 // Admin updates a staff member's role / permissions / active state
 updateStaff = asyncHandler(async(req,res)=>{
     const { role, permissions, active } = req.body
-    const target = await User.findByPk(req.params.id)
+    const target = await prisma.user.findUnique({ where: { id: Number(req.params.id) } })
     if (!target){ res.status(404); throw new Error('User not found') }
 
-    const update = {}
+    const data = {}
     if (role){
         if (!['admin','manager','guest'].includes(role)){
             res.status(400); throw new Error('Invalid role')
         }
-        update.role = role
-        update.isAdmin = role === 'admin'
+        data.role = role
+        data.isAdmin = role === 'admin'
     }
-    if (permissions) update.permissions = permissions
-    if (typeof active === 'boolean') update.active = active
+    if (permissions) data.permissions = permissions
+    if (typeof active === 'boolean') data.active = active
 
-    await target.update(update)
-    const { password: pw, ...others } = target.get({ plain: true })
+    const updated = await prisma.user.update({ where: { id: target.id }, data })
+    const { password: pw, ...others } = updated
     res.status(200).json(toClientJSON(others))
 })
 

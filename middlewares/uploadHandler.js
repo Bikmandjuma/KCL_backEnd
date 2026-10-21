@@ -31,4 +31,11 @@ const uploadProductWithGallery = uploadProduct.fields([
     { name: 'gallery', maxCount: 5 },
 ])
 
-module.exports = { uploadProduct, uploadDrink, uploadProof, uploadProductWithGallery }
+// An employee's History card: one cover photo plus up to 6 extra gallery shots.
+const uploadStaffPhotos = multer({ storage: makeStorage('staff'), fileFilter, limits: { fileSize: 5 * 1024 * 1024 } })
+const uploadStaffStory = uploadStaffPhotos.fields([
+    { name: 'coverImage', maxCount: 1 },
+    { name: 'gallery', maxCount: 6 },
+])
+
+module.exports = { uploadProduct, uploadDrink, uploadProof, uploadProductWithGallery, uploadStaffStory }

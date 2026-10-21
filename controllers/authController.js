@@ -1,8 +1,9 @@
 const asyncHandler = require('express-async-handler')
 const CryptoJS = require('crypto-js')
 const jwt = require('jsonwebtoken')
-const { User, Cart } = require('../models')
+const { prisma } = require('../config/dbConnection')
 const { toClientJSON } = require('../utils/transform')
+const { defaultPermissions } = require('../utils/permissions')
 
 //To Register a User - public registration always creates a "guest" (client) account.
 //Admin/Manager accounts are created from the Admin panel only (see userController.createStaff)
@@ -13,21 +14,24 @@ userRegister = asyncHandler(async(req,res)=>{
         throw new Error('All fields are mandatory')
     }
 
-    const usernameAvailable = await User.findOne({ where: { username } })
+    const usernameAvailable = await prisma.user.findUnique({ where: { username } })
     if (usernameAvailable){
         res.status(400)
         throw new Error('UserName Taken')
     }
-    const emailAvailable = await User.findOne({ where: { email } })
+    const emailAvailable = await prisma.user.findUnique({ where: { email } })
     if (emailAvailable){
         res.status(400)
         throw new Error('Email Taken')
     }
     const hashedPassword = CryptoJS.AES.encrypt(password, process.env.PASSWORD_KEY).toString()
-    const user = await User.create({
-        username, email, password: hashedPassword, phone, role: 'guest', isAdmin: false
+    const user = await prisma.user.create({
+        data: {
+            username, email, password: hashedPassword, phone,
+            role: 'guest', isAdmin: false, permissions: defaultPermissions,
+        },
     })
-    const { password: pw, ...others } = user.get({ plain: true })
+    const { password: pw, ...others } = user
     res.status(201).json(toClientJSON(others))
 })
 
@@ -38,7 +42,7 @@ loginUser = asyncHandler(async(req,res)=>{
         res.status(400)
         throw new Error('All fields are mandatory')
     }
-    const user = await User.findOne({ where: { email } })
+    const user = await prisma.user.findUnique({ where: { email } })
 
     if (!user){
         res.status(400)
@@ -60,9 +64,9 @@ loginUser = asyncHandler(async(req,res)=>{
         permissions: user.permissions,
     }, process.env.JWT_KEY,{expiresIn: '1d'})
 
-    let cart = await Cart.findOne({ where: { userId: user.id } })
+    let cart = await prisma.cart.findUnique({ where: { userId: user.id } })
     if (!cart){
-        cart = await Cart.create({ userId: user.id })
+        cart = await prisma.cart.create({ data: { userId: user.id } })
     }
 
     res.status(200).json(toClientJSON({

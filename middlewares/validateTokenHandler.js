@@ -31,6 +31,22 @@ const validateTokenAndAuth = (req,res,next)=>{
     })
 }
 
+// Attaches req.user if a valid token is present, but never blocks the
+// request otherwise - used for guest-friendly endpoints (like placing or
+// tracking an order) that work with or without an account.
+const optionalAuth = (req, res, next) => {
+    const authHeader = req.headers.Authorization || req.headers.authorization
+    if (authHeader && authHeader.startsWith('Bearer')) {
+        const token = authHeader.split(' ')[1]
+        jwt.verify(token, process.env.JWT_KEY, (err, decoded) => {
+            if (!err) req.user = decoded
+            next()
+        })
+    } else {
+        next()
+    }
+}
+
 // Only the Admin role may pass
 const AdminAuth = (req,res,next)=>{
     validateToken(req,res,()=>{
@@ -53,4 +69,14 @@ const StaffAuth = (permission) => (req, res, next) => {
     })
 }
 
-module.exports = { validateToken, validateTokenAndAuth, AdminAuth, StaffAuth }
+// Admin OR any Manager, regardless of which specific permissions they hold -
+// for endpoints that are harmless to any staff account (e.g. plain counts)
+// and whose actual data access is already gated per-resource elsewhere.
+const AnyStaffAuth = (req, res, next) => {
+    validateToken(req, res, () => {
+        if (req.user.isAdmin || req.user.role === 'admin' || req.user.role === 'manager') return next()
+        return res.status(403).json({ msg: 'Staff access only' })
+    })
+}
+
+module.exports = { validateToken, validateTokenAndAuth, AdminAuth, StaffAuth, AnyStaffAuth, optionalAuth }
