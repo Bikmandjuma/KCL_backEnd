@@ -5,7 +5,7 @@ const path = require('path')
 // The public, customer-facing URL a printed table sticker points to - the
 // frontend app's own origin, not this API. Configure via FRONTEND_URL in
 // .env; falls back to the Vite dev server's default port.
-const FRONTEND_URL = (process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/$/, '')
+const FRONTEND_URL = (process.env.FRONTEND_URL || 'https://kigalicoffeelab.com').replace(/\/$/, '')
 
 const tableScanUrl = (qrToken) => `${FRONTEND_URL}/t/${qrToken}`
 
